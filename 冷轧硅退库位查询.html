@@ -223,6 +223,7 @@
     color: #007AFF;
   }
 </style>
+<script src="https://cdn.bootcdn.net/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 <div class="container">
@@ -232,17 +233,18 @@
   </div>
 
   <div class="card" id="pasteCard">
-    <div class="paste-area" id="pasteArea" onclick="triggerPaste()">
+    <div class="paste-area" id="pasteArea" onclick="document.getElementById('fileInput').click()">
       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-      <div class="title">点击粘贴 Excel 数据</div>
-      <div class="subtitle">从公司Excel全选复制，在此粘贴</div>
+      <div class="title">点击上传 Excel 文件</div>
+      <div class="subtitle">支持 .xlsx / .xls / .csv，也保留 Ctrl+V 粘贴</div>
     </div>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none;" onchange="handleFile(this.files[0])">
     <div class="instructions">
       <strong>使用方法：</strong><br>
-      1. 打开公司共享Excel，按 <code>Ctrl+A</code> 全选所有Sheet内容<br>
-      2. 按 <code>Ctrl+C</code> 复制<br>
-      3. 回到此页面，点击上方区域粘贴<br>
-      4. 在搜索框输入编号前缀即可查找
+      1. 点击上方区域，选择本地 Excel 文件（.xlsx / .xls / .csv）<br>
+      2. 程序会自动读取所有 Sheet 并提取卷号和位置<br>
+      3. 在搜索框输入编号前缀即可查找<br>
+      4. 也支持直接按 <code>Ctrl+V</code> 粘贴表格内容
     </div>
   </div>
 
@@ -269,8 +271,12 @@ let sheets = [];
 // 监听粘贴事件
 document.addEventListener('paste', function(e) {
   const text = e.clipboardData.getData('text');
-  if (text && text.length > 100) {
+  if (!text || text.length < 20) return;
+  // 旧版管道格式用旧解析器，否则按表格/TSV解析
+  if (text.includes('|') || text.includes('# ')) {
     parseExcelData(text);
+  } else {
+    parseTsvData(text);
   }
 });
 
@@ -295,6 +301,145 @@ function showToast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+function handleFile(file) {
+  if (!file) return;
+  showToast('正在读取文件...');
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const workbook = XLSX.read(data, {type: 'array'});
+      parseWorkbook(workbook);
+    } catch (err) {
+      showToast('文件解析失败：' + err.message);
+      console.error(err);
+    }
+  };
+  reader.onerror = function() {
+    showToast('读取文件失败');
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function parseWorkbook(workbook) {
+  showToast('正在解析 Excel...');
+  allData = [];
+  sheets = workbook.SheetNames;
+  workbook.SheetNames.forEach(sheetName => {
+    const worksheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(worksheet, {header: 1, defval: ''});
+    processSheetRows(sheetName, rows);
+  });
+  finishImport();
+}
+
+function processSheetRows(sheetName, rows) {
+  if (!rows || rows.length === 0) return;
+
+  // 找表头行
+  const headerKeywords = /卷号|钢卷号|规格型号|序号|排列号|排位|库位|位置|行|列|库区/;
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const row = rows[i].map(c => String(c).trim());
+    if (row.some(cell => headerKeywords.test(cell))) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx === -1) headerIdx = 0;
+
+  const headers = rows[headerIdx].map(c => String(c).trim());
+  const rollHeaderIdx = headers.findIndex(h => /卷号|钢卷号|规格型号/.test(h));
+
+  const positionPatterns = [
+    {re: /排列号/, label: '排列号'},
+    {re: /排位/, label: '排位'},
+    {re: /库位|位置/, label: ''},
+    {re: /行/, label: '行'},
+    {re: /列/, label: '列'},
+    {re: /库区|区/, label: ''},
+    {re: /排/, label: '排'},
+    {re: /架|层/, label: ''}
+  ];
+
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const rawRow = rows[i].map(c => String(c).trim());
+    if (rawRow.every(c => !c)) continue;
+
+    let rollIdx = -1;
+    let cellText = '';
+    if (rollHeaderIdx >= 0 && rawRow[rollHeaderIdx]) {
+      rollIdx = rollHeaderIdx;
+      cellText = rawRow[rollHeaderIdx];
+    } else {
+      for (let j = 0; j < rawRow.length; j++) {
+        if (extractRollId(rawRow[j])) {
+          rollIdx = j;
+          cellText = rawRow[j];
+          break;
+        }
+      }
+    }
+    if (!cellText) continue;
+
+    const rollId = extractRollId(cellText);
+    if (!rollId) continue;
+
+    let position = '';
+    if (sheetName.includes('南山')) {
+      position = '南山外库';
+    } else {
+      const parts = [];
+      for (const p of positionPatterns) {
+        const colIdx = headers.findIndex(h => p.re.test(h));
+        if (colIdx >= 0 && colIdx !== rollIdx && rawRow[colIdx]) {
+          const label = p.label || headers[colIdx];
+          parts.push(label + (p.label ? '：' : '') + rawRow[colIdx]);
+        }
+      }
+      if (parts.length === 0) {
+        const others = rawRow.map((c, idx) => ({c, idx}))
+          .filter(({c, idx}) => c && idx !== rollIdx)
+          .map(({c}) => c);
+        if (others.length > 0) parts.push(...others);
+      }
+      position = parts.length > 0 ? parts.join(' / ') : sheetName;
+    }
+
+    allData.push({
+      id: rollId,
+      sheet: sheetName,
+      position: position,
+      raw: cellText,
+      row: rawRow[0] || ''
+    });
+  }
+}
+
+function finishImport() {
+  if (allData.length === 0) {
+    showToast('未识别到卷号数据，请检查表格内容');
+    return;
+  }
+
+  const seen = new Set();
+  allData = allData.filter(item => {
+    const key = item.id + '|' + item.sheet + '|' + item.position;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  allData.sort((a, b) => a.id.localeCompare(b.id));
+
+  currentSheet = '全部';
+  document.getElementById('pasteCard').style.display = 'none';
+  document.getElementById('searchCard').style.display = 'block';
+  updateStats();
+  renderSheetTabs();
+  showToast(`成功导入 ${allData.length} 条记录`);
+  setTimeout(() => document.getElementById('searchInput').focus(), 300);
 }
 
 function parseExcelData(text) {
@@ -362,33 +507,16 @@ function parseExcelData(text) {
     rowNum++;
   }
 
-  if (allData.length === 0) {
-    showToast('未识别到卷号数据，请确保复制了完整Excel内容');
-    return;
-  }
+  finishImport();
+}
 
-  // 去重
-  const seen = new Set();
-  allData = allData.filter(item => {
-    const key = item.id + '|' + item.sheet + '|' + item.position;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  // 排序
-  allData.sort((a, b) => a.id.localeCompare(b.id));
-
-  // 更新UI
-  document.getElementById('pasteCard').style.display = 'none';
-  document.getElementById('searchCard').style.display = 'block';
-
-  updateStats();
-  renderSheetTabs();
-  showToast(`成功导入 ${allData.length} 条记录`);
-
-  // 自动聚焦搜索框
-  setTimeout(() => document.getElementById('searchInput').focus(), 300);
+function parseTsvData(text) {
+  showToast('正在解析粘贴数据...');
+  allData = [];
+  sheets = ['粘贴数据'];
+  const rows = text.split(/\r?\n/).map(line => line.split('\t'));
+  processSheetRows('粘贴数据', rows);
+  finishImport();
 }
 
 function extractRollId(text) {
